@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#
+# Keeps sheet music in step with the tabs, on every commit:
+#
+#   1. Any score changed in this commit gets its PDF/MIDI rebuilt. If that
+#      fails, the commit is stopped -- a tab should never land without its
+#      sheet music.
+#   2. Any song in the repo that is missing assets entirely gets them built
+#      and included, whether or not you touched it. That makes the repo
+#      self-healing: songs added before this tooling existed fill themselves
+#      in on the next commit.
+#
+# Note what it deliberately does NOT do: rebuild assets that already exist and
+# are current. PDF and MP3 encoders stamp timestamps into their output, so
+# rebuilding everything every time would mark every asset as changed on every
+# commit and the history would stop showing what actually changed. Only missing
+# or outdated files are ever written.
+#
+# Installed by ./setup (which points git's core.hooksPath at this folder).
+# To commit without running this: git commit --no-verify
+#
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)" || exit 0
+cd "$ROOT" || exit 0
+
+CONV="$ROOT/.reprise/tools/gp-convert.sh"
+[ -r "$CONV" ] || { printf '\033[33mgp: .reprise/tools/gp-convert.sh missing; skipping asset build\033[0m\n' >&2; exit 0; }
+
+# Shared, committed settings. See .reprise/reprise.conf for what these mean.
+COMMIT_FORMATS="pdf,mid"
+COMMIT_MP3=0
+MP3_BITRATE=256
+# shellcheck source=/dev/null
+[ -f "$ROOT/.reprise/reprise.conf" ] && . "$ROOT/.reprise/reprise.conf"
+
+# MP3s are opt-in: they're big and re-encode to different bytes every render.
+FORMATS="$COMMIT_FORMATS"
+EXTS="pdf mid"
+if [ "${COMMIT_MP3:-0}" = "1" ]; then
+  FORMATS="$FORMATS,mp3"
+  EXTS="$EXTS mp3"
+fi
+
+SCORE_GLOBS="*.gp *.gpx *.gp3 *.gp4 *.gp5 *.gtp"
+
+# Every song in the repo that is missing at least one of its assets.
+# Reads from the index, so a brand-new song staged in this commit counts too.
+missing_songs() {
+  local f dir base ext
+  while IFS= read -r -d '' f; do
+    dir="$(dirname "$f")"
+    base="$(basename "$f")"; base="${base%.*}"
+    for ext in $EXTS; do
+      if [ ! -s "$dir/$base.$ext" ]; then
+        printf '%s\0' "$f"
+        break
+      fi
+    done
+  # shellcheck disable=SC2086
+  done < <(git ls-files -z -- $SCORE_GLOBS 2>/dev/null)
+}
+
+stage_assets() {
+  local f dir base ext out rc=0
+  for f in "$@"; do
+    dir="$(dirname "$f")"
+    base="$(basename "$f")"; base="${base%.*}"
+    for ext in $EXTS; do
+      out="$dir/$base.$ext"
+      if [ -s "$out" ]; then
+        # -f because .gitignore lists *.mp3: when COMMIT_MP3=1 the config is
+        # the deliberate override, and a plain `git add` would silently refuse.
+        git add -f -- "$out"
+      else
+        printf '\033[31mgp: missing %s\033[0m\n' "$out" >&2
+        rc=1
+      fi
+    done
+  done
+  return "$rc"
+}
+
+# --- scores changed in this commit (deletions excluded) ---------------------
+STAGED=()
+while IFS= read -r -d '' f; do
+  STAGED+=("$f")
+# shellcheck disable=SC2086
+done < <(git diff --cached -z --name-only --diff-filter=ACM -- $SCORE_GLOBS 2>/dev/null)
+
+# --- songs missing assets altogether ---------------------------------------
+GAPS=()
+while IFS= read -r -d '' f; do
+  GAPS+=("$f")
+done < <(missing_songs)
+
+# Nothing to do at all: get out of the way.
+if [ "${#STAGED[@]}" -eq 0 ] && [ "${#GAPS[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+# If MuseScore isn't installed we warn but let the commit through. Blocking
+# someone from saving a tab edit because their laptop lacks a converter is
+# worse than letting the assets lag one commit behind.
+if ! bash "$CONV" --check --quiet 2>/dev/null; then
+  printf '\033[33m\n'
+  printf 'gp: MuseScore is not installed on this machine, so sheet music was\n'
+  printf '    not built. Your commit went through as-is.\n'
+  printf '    Install it from https://musescore.org and run ./setup again.\n'
+  printf '\033[0m\n'
+  exit 0
+fi
+
+RC=0
+
+# --- 1. rebuild what changed (failure blocks the commit) -------------------
+if [ "${#STAGED[@]}" -gt 0 ]; then
+  printf '\033[36mgp: rebuilding %d changed score(s)\033[0m\n' "${#STAGED[@]}"
+  bash "$CONV" --formats "$FORMATS" --bitrate "$MP3_BITRATE" "${STAGED[@]}" || RC=1
+  stage_assets "${STAGED[@]}" || RC=1
+fi
+
+# --- 2. fill in anything still missing (failure warns, doesn't block) ------
+# Recomputed, so scores just rebuilt above have already dropped off the list.
+GAPS=()
+while IFS= read -r -d '' f; do
+  GAPS+=("$f")
+done < <(missing_songs)
+
+if [ "${#GAPS[@]}" -gt 0 ]; then
+  printf '\033[36mgp: filling in %d song(s) with missing sheet music\033[0m\n' "${#GAPS[@]}"
+  if bash "$CONV" --formats "$FORMATS" --bitrate "$MP3_BITRATE" "${GAPS[@]}"; then
+    stage_assets "${GAPS[@]}" >/dev/null 2>&1 || true
+  else
+    # Don't block: these are songs the committer may not have touched, and
+    # refusing their unrelated edit over someone else's broken score is worse.
+    printf '\033[33mgp: some songs could not be filled in (see above).\n'
+    printf '    Your commit still went through.\033[0m\n'
+    stage_assets "${GAPS[@]}" >/dev/null 2>&1 || true
+  fi
+fi
+
+if [ "$RC" -ne 0 ]; then
+  printf '\033[31m\n'
+  printf 'gp: a score you changed failed to convert (see above).\n'
+  printf '    Commit stopped so you do not push a tab without its sheet music.\n'
+  printf '    Most often the file is still open in Guitar Pro -- save, close,\n'
+  printf '    and try again. To commit anyway: git commit --no-verify\n'
+  printf '\033[0m\n'
+  exit 1
+fi
+
+exit 0
