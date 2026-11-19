@@ -1,0 +1,12 @@
+# Generated audio. Built on demand, never committed: it is large and it
+# re-encodes to different bytes every render.
+*.mp3
+
+# Working documents for whoever is driving Claude Code in this repo.
+VOICE.md
+CLAUDE.md
+
+# Mac clutter
+.DS_Store
+
+__pycache__/

@@ -1,0 +1,34 @@
+# Line endings. This file matters more than it looks.
+#
+# Git for Windows defaults to core.autocrlf=true, which would check the
+# scripts out with CRLF. bash then fails immediately with $'\r' errors before
+# doing anything useful. Rules here override each person's local git config,
+# so this is the reliable place to pin it.
+
+# Everything in .reprise is bash and must stay LF.
+.reprise/**     text eol=lf
+
+# Mac double-click launcher: bash, so LF.
+*.command       text eol=lf
+
+# Windows double-click launcher: cmd.exe, which wants CRLF.
+*.cmd           text eol=crlf
+
+# Test scripts are bash.
+tests/**        text eol=lf
+
+# Guitar Pro files and generated assets are binary. Never translate line
+# endings, and do not attempt textual diffs.
+#
+# *.gp binary is load-bearing: without it git injects conflict markers into
+# what is actually a zip archive and corrupts the tab.
+*.gp            binary
+*.gpx           binary
+*.gp3           binary
+*.gp4           binary
+*.gp5           binary
+*.gtp           binary
+*.pdf           binary
+*.mid           binary
+*.midi          binary
+*.mp3           binary
