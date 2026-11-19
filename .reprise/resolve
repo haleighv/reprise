@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+#
+# Two people edited the same song. Guitar Pro files are binary -- git cannot
+# merge them, and there is no sensible automatic answer, so this does the only
+# safe thing:
+#
+#   * the band's version becomes the current file
+#   * your version is saved next to it, clearly labelled
+#   * a backup branch is left behind pointing at your original commit
+#   * git is returned to a clean state
+#
+# You then open both in Guitar Pro and recombine them by hand, which is the
+# only way a tab can really be merged.
+#
+# Called automatically by .reprise/sync when a catch-up hits a conflict, and by
+# .reprise/menu if it finds a half-finished rebase from a previous attempt.
+#
+set -uo pipefail
+
+C_H='\033[1m'; C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_D='\033[2m'; C_0='\033[0m'
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 1
+cd "$ROOT" || exit 1
+
+# Shared settings, including who a bandmate should contact when something
+# goes wrong. Defaults keep the scripts working if the file is missing.
+CONTACT_NAME="whoever set this up"
+CONTACT_HOW=""
+# shellcheck source=/dev/null
+[ -f "$ROOT/.reprise/reprise.conf" ] && . "$ROOT/.reprise/reprise.conf"
+
+# --------------------------------------------------- is anything in flight? --
+REBASING=0
+[ -d "$(git rev-parse --git-path rebase-merge 2>/dev/null)" ] && REBASING=1
+[ -d "$(git rev-parse --git-path rebase-apply 2>/dev/null)" ] && REBASING=1
+MERGING=0
+[ -f "$(git rev-parse --git-path MERGE_HEAD 2>/dev/null)" ] && MERGING=1
+
+if [ "$REBASING" -eq 0 ] && [ "$MERGING" -eq 0 ]; then
+  printf '%bNothing to untangle -- git is already in a clean state.%b\n' "$C_G" "$C_0"
+  exit 0
+fi
+
+# ------------------------------------------------------- who and when ------
+WHO="$(git config user.name 2>/dev/null)"
+[ -n "$WHO" ] || WHO="someone"
+# Strip characters Windows will not accept in a filename.
+WHO="$(printf '%s' "$WHO" | tr -d '\\/:*?"<>|' | cut -c1-24)"
+WHEN="$(date '+%Y-%m-%d')"
+
+# Which branch were we on? During a rebase HEAD is detached, so fall back to
+# the name git stashed away for us.
+BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+if [ -z "$BRANCH" ]; then
+  HN="$(git rev-parse --git-path rebase-merge/head-name 2>/dev/null)"
+  [ -f "$HN" ] && BRANCH="$(sed 's#^refs/heads/##' "$HN")"
+fi
+[ -n "$BRANCH" ] || BRANCH="$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+[ -n "$BRANCH" ] || BRANCH=master
+
+printf '\n%b================ SAME SONG, TWO VERSIONS ================%b\n\n' "$C_H" "$C_0"
+printf 'You and someone else changed the same tab. Tabs cannot be merged\n'
+printf 'automatically, so both versions are being kept.\n\n'
+
+# --------------------------------- rescue my side of each conflicted score --
+# IMPORTANT: during a rebase the stages are inverted from intuition.
+#   stage 2 ("ours")   = the branch being rebased ONTO  -> the band's version
+#   stage 3 ("theirs") = the commit being replayed      -> MY version
+# So my work is stage 3. Getting this backwards would save the wrong file.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/gpresolve.XXXXXX")" || exit 1
+SAVED=0
+SAVED_LIST=""
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    *.gp|*.gpx|*.gp3|*.gp4|*.gp5|*.gtp) ;;
+    *) continue ;;                      # pdf/mid are rebuilt, never rescued
+  esac
+  dir="$(dirname "$f")"
+  base="$(basename "$f")"
+  ext="${base##*.}"
+  stem="${base%.*}"
+  dest="$dir/$stem ($WHO $WHEN).$ext"
+  flat="$TMP/$(printf '%s' "$dest" | tr '/' '_')"
+  if git show ":3:$f" > "$flat" 2>/dev/null && [ -s "$flat" ]; then
+    printf '%s\n' "$dest" >> "$TMP/.manifest"
+    printf '%s\n' "$flat"  >> "$TMP/.sources"
+    SAVED=$((SAVED + 1))
+    SAVED_LIST="$SAVED_LIST  $dest
+"
+  fi
+done < <(git diff --name-only --diff-filter=U 2>/dev/null)
+
+# ------------------------------------------------- back to a clean state ----
+if [ "$REBASING" -eq 1 ]; then
+  git rebase --abort >/dev/null 2>&1
+else
+  git merge --abort >/dev/null 2>&1
+fi
+
+# A branch pointing at my original commit, so nothing is ever truly gone even
+# if the labelled copies get deleted.
+BACKUP="unsent/$WHEN-$(date '+%H%M')"
+git branch "$BACKUP" >/dev/null 2>&1 && BACKUP_OK=1 || BACKUP_OK=0
+
+# ------------------------------------------- adopt the band's version ------
+git fetch origin >/dev/null 2>&1
+if ! git reset --hard "origin/$BRANCH" >/dev/null 2>&1; then
+  printf '%bCould not line up with the band'\''s copy.%b\n' "$C_R" "$C_0"
+  printf 'Nothing was thrown away. Ask %s.\n' "$CONTACT_NAME"
+  exit 1
+fi
+
+# ------------------------------------- put my version back, beside theirs --
+if [ "$SAVED" -gt 0 ] && [ -f "$TMP/.manifest" ]; then
+  i=0
+  while IFS= read -r dest; do
+    i=$((i + 1))
+    src="$(sed -n "${i}p" "$TMP/.sources")"
+    [ -n "$src" ] && [ -f "$src" ] || continue
+    mkdir -p "$(dirname "$dest")" 2>/dev/null
+    cp "$src" "$dest" 2>/dev/null
+  done < "$TMP/.manifest"
+fi
+rm -rf "$TMP"
+
+# ------------------------------------------------------------- the report ---
+printf '%bThe band'\''s version is now the live file.%b\n\n' "$C_G" "$C_0"
+if [ "$SAVED" -gt 0 ]; then
+  printf '%bYour version was saved as:%b\n' "$C_H" "$C_0"
+  printf '%s\n' "$SAVED_LIST"
+  printf '%bWhat to do now:%b\n' "$C_H" "$C_0"
+  printf '  1. Open both files in Guitar Pro, side by side.\n'
+  printf '  2. Copy your parts into the live file.\n'
+  printf '  3. Delete the saved copy when you are done with it.\n'
+  printf '  4. Double-click Reprise and press Enter to send the result.\n\n'
+else
+  printf '%bNo tab of yours needed rescuing.%b\n\n' "$C_D" "$C_0"
+fi
+if [ "$BACKUP_OK" -eq 1 ]; then
+  printf '%bA backup of your original commit is on branch "%s"%b\n' "$C_D" "$BACKUP" "$C_0"
+  printf '%b(for %s, if anything looks wrong).%b\n\n' "$C_D" "$CONTACT_NAME" "$C_0"
+fi
+printf '%bTo avoid this: press 2 (get the latest) before you start playing.%b\n\n' "$C_D" "$C_0"

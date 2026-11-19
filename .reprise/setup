@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# Run this once per computer, from inside the repo:
+#
+#     ./setup
+#
+# It teaches git to rebuild sheet music whenever you commit a tab, and checks
+# that MuseScore is installed. Safe to run again any time.
+#
+set -uo pipefail
+
+ok()   { printf '\033[32m  ok\033[0m    %s\n' "$*"; }
+warn() { printf '\033[33m  note\033[0m  %s\n' "$*"; }
+bad()  { printf '\033[31m  need\033[0m  %s\n' "$*"; }
+
+printf '\n\033[1mSetting up tab asset generation\033[0m\n\n'
+
+# ----------------------------------------------------------- in a repo? -----
+if ! ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  bad "This folder isn't a git repository."
+  printf '\n      Move these files into your band repo and run ./setup there.\n\n'
+  exit 1
+fi
+cd "$ROOT" || exit 1
+ok "repo: $ROOT"
+
+# ------------------------------------------------------- make executable ----
+chmod +x .reprise/setup .reprise/sync .reprise/mp3 .reprise/send .reprise/menu "Reprise (MAC).command" 2>/dev/null
+chmod +x .reprise/tools/gp-convert.sh .reprise/hooks/pre-commit 2>/dev/null
+ok "scripts are executable"
+
+# ----------------------------------------------------- syntax self-check ----
+# Run every script through THIS machine's bash. macOS still ships bash 3.2,
+# which rejects constructs that bash 4/5 accept, so a script can be perfectly
+# valid where it was written and fail here. This is the only place that can be
+# caught reliably: on the machine that will actually run them.
+SYNTAX_OK=1
+for s in .reprise/menu .reprise/send .reprise/setup .reprise/sync .reprise/mp3 \
+         .reprise/hooks/pre-commit .reprise/tools/gp-convert.sh \
+         "Reprise (MAC).command"; do
+  [ -f "$s" ] || continue
+  if ! err="$(bash -n "$s" 2>&1)"; then
+    SYNTAX_OK=0
+    bad "$s will not run on this machine's bash"
+    printf '%s\n' "$err" | sed 's/^/        /'
+  fi
+done
+if [ "$SYNTAX_OK" -eq 1 ]; then
+  ok "all scripts parse on bash ${BASH_VERSION:-unknown}"
+else
+  printf '\n      ^ This is a bug in the scripts, not something you did.\n'
+  printf '        Send the lines above to $CONTACT_NAME. Stopping here.\n\n'
+  exit 1
+fi
+
+# ------------------------------------------------------------- the hook -----
+git config core.hooksPath .reprise/hooks
+ok "git will run .reprise/hooks/pre-commit from now on"
+
+# -------------------------------------------------------------- MuseScore ---
+if MSCORE="$(bash "$ROOT/.reprise/tools/gp-convert.sh" --check 2>/dev/null)"; then
+  ok "MuseScore found: $MSCORE"
+else
+  bad "MuseScore is not installed."
+  printf '\n'
+  printf '      1. Go to https://musescore.org and download it (free).\n'
+  printf '      2. Open the download and drag MuseScore into Applications.\n'
+  printf '      3. Run ./setup again.\n\n'
+  printf '      Until then you can still edit and commit tabs -- the PDFs\n'
+  printf '      just will not be rebuilt on your machine.\n\n'
+fi
+
+# ---------------------------------------------------------------- gitignore --
+COMMIT_MP3=0
+# shellcheck source=/dev/null
+[ -f .reprise/reprise.conf ] && . .reprise/reprise.conf
+
+if [ "${COMMIT_MP3:-0}" = "1" ]; then
+  ok "reprise.conf says MP3s WILL be committed (COMMIT_MP3=1)"
+  warn "expect the repo to grow a few MB per song per edit. Consider Git LFS."
+else
+  # MP3s are generated on demand, never committed.
+  if [ -f .gitignore ] && grep -qx '\*\.mp3' .gitignore 2>/dev/null; then
+    ok "*.mp3 ignored (audio is made on demand with ./mp3)"
+  else
+    {
+      printf '\n# Audio is generated on demand with ./mp3 -- never committed.\n'
+      printf '*.mp3\n'
+    } >> .gitignore
+    ok "added *.mp3 to .gitignore"
+  fi
+
+  # Catch the case where MP3s were committed before this was set up.
+  if git ls-files --error-unmatch '*.mp3' >/dev/null 2>&1; then
+    warn "some .mp3 files are already tracked by git."
+    printf '      To stop tracking them (the files stay on disk):\n'
+    printf '          git rm --cached "*.mp3" && git commit -m "Stop tracking mp3s"\n'
+  fi
+fi
+
+printf '\n\033[1mDone.\033[0m From now on:\n\n'
+printf '  Double-click \033[1mReprise\033[0m in this folder whenever you want to send\n'
+printf '  your work to the band, grab everyone else'\''s latest, or make audio.\n\n'
+printf '  (Terminal equivalents, if you prefer: .reprise/sync, .reprise/mp3)\n\n'

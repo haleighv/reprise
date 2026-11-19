@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# Make MP3s to play along with. No metronome, no count-in.
+#
+#     ./mp3                 # every tab in the repo that needs one
+#     ./mp3 songs/a-song.gp    # just this one
+#     ./mp3 --force         # rebuild even if the MP3 looks current
+#
+# MP3s are not committed to git -- they're big and they change every time they
+# are rendered. Run this after you pull and you'll have fresh audio.
+#
+set -uo pipefail
+
+FORCE=()
+FILES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)   FORCE=(--force); shift ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)         FILES+=("$1"); shift ;;
+  esac
+done
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || ROOT="$(pwd)"
+cd "$ROOT" || exit 1
+
+CONV="$ROOT/.reprise/tools/gp-convert.sh"
+[ -r "$CONV" ] || { printf '\033[31m.reprise/tools/gp-convert.sh is missing. Run ./setup first.\033[0m\n' >&2; exit 1; }
+
+MP3_BITRATE=256
+# shellcheck source=/dev/null
+[ -f "$ROOT/.reprise/reprise.conf" ] && . "$ROOT/.reprise/reprise.conf"
+
+# No files named? Take every Guitar Pro file in the repo.
+if [ "${#FILES[@]}" -eq 0 ]; then
+  while IFS= read -r -d '' f; do
+    FILES+=("$f")
+  done < <(find . -type d -name .git -prune -o \
+                -type f \( -name '*.gp' -o -name '*.gpx' -o -name '*.gp3' \
+                        -o -name '*.gp4' -o -name '*.gp5' -o -name '*.gtp' \) -print0 \
+            2>/dev/null)
+fi
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  printf '\nNo Guitar Pro files found here.\n\n'
+  exit 0
+fi
+
+printf '\n\033[1mRendering audio (%d score(s)). This takes a moment each.\033[0m\n\n' "${#FILES[@]}"
+bash "$CONV" --formats mp3 --bitrate "$MP3_BITRATE" ${FORCE[@]+"${FORCE[@]}"} "${FILES[@]}"
+RC=$?
+
+printf '\n'
+if [ "$RC" -eq 0 ]; then
+  printf '\033[32mDone.\033[0m MP3s are next to each tab. They stay on your machine only.\n\n'
+else
+  printf '\033[33mSome scores did not render -- see the messages above.\033[0m\n\n'
+fi
+exit "$RC"

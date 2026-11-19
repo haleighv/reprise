@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+#
+# One command for the studio: save everything, rebuild the sheet music, and
+# send it to the band.
+#
+#     ./sync                      # commits with an automatic message
+#     ./sync "new bridge riff"    # commits with your message
+#     ./sync --dry-run            # show what would happen, change nothing
+#
+set -uo pipefail
+
+DRY=0
+MSG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY=1; shift ;;
+    -h|--help)    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)            MSG="$1"; shift ;;
+  esac
+done
+
+step() { printf '\n\033[36m%s\033[0m\n' "$*"; }
+bad()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { bad "Not inside a git repository."; exit 1; }
+cd "$ROOT" || exit 1
+
+# Never touch anything while a rebase or merge is half-finished. `git add -A`
+# would stage the conflicted file and mark it resolved with whichever side
+# happens to be in the working tree -- silently throwing away the other
+# person's work. Hand it to the resolver instead.
+if [ -d "$(git rev-parse --git-path rebase-merge 2>/dev/null)" ] \
+   || [ -d "$(git rev-parse --git-path rebase-apply 2>/dev/null)" ] \
+   || [ -f "$(git rev-parse --git-path MERGE_HEAD 2>/dev/null)" ]; then
+  printf '\n\033[33mThere is an unfinished catch-up from last time. Sorting it out first.\033[0m\n'
+  bash "$ROOT/.reprise/resolve"
+  exit $?
+fi
+
+# ------------------------------------------------------- anything to do? ----
+if [ -z "$(git status --porcelain)" ]; then
+  printf '\nNothing has changed. Already in sync.\n\n'
+  exit 0
+fi
+
+step "Changes to save:"
+git status --short
+
+if [ "$DRY" -eq 1 ]; then
+  printf '\n(dry run -- stopping here, nothing committed)\n\n'
+  exit 0
+fi
+
+# ------------------------------------------------------------------ commit --
+if [ -z "$MSG" ]; then
+  # Name the scores that changed, so the history is readable without effort.
+  NAMES=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n="$(basename "$line")"   # strip folders
+    n="${n%.*}"               # strip extension
+    case ",$NAMES," in
+      *",$n,"*) continue ;;   # already listed
+    esac
+    if [ -z "$NAMES" ]; then NAMES="$n"; else NAMES="$NAMES,$n"; fi
+  done < <(git status --porcelain -- '*.gp' '*.gpx' '*.gp3' '*.gp4' '*.gp5' '*.gtp' \
+             | cut -c4-)
+  if [ -n "$NAMES" ]; then
+    MSG="Update $(printf '%s' "$NAMES" | sed 's/,/, /g')"
+  else
+    MSG="Update $(date '+%Y-%m-%d %H:%M')"
+  fi
+fi
+
+step "Saving as: $MSG"
+git add -A
+# The pre-commit hook rebuilds PDFs/MIDI here and adds them to this commit.
+if ! git commit -m "$MSG"; then
+  bad ""
+  bad "Commit stopped. Nothing was sent to the band."
+  bad "Scroll up -- if a score failed to convert, the reason is above."
+  exit 1
+fi
+
+# -------------------------------------------------------------------- push --
+step "Sending to the band..."
+if git push 2>/dev/null; then
+  printf '\n\033[32mDone. Everyone can pull it now.\033[0m\n\n'
+  exit 0
+fi
+
+# No upstream set yet (fresh branch).
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if git push -u origin "$BRANCH" 2>/dev/null; then
+  printf '\n\033[32mDone. Everyone can pull it now.\033[0m\n\n'
+  exit 0
+fi
+
+# Someone else pushed first -- catch up and retry once.
+step "Someone else pushed first. Catching up..."
+if git pull --rebase; then
+  if git push; then
+    printf '\n\033[32mDone. Everyone can pull it now.\033[0m\n\n'
+    exit 0
+  fi
+  bad ""
+  bad "Caught up, but still could not send. Try again in a moment."
+  exit 1
+fi
+
+# The catch-up hit a conflict: two people changed the same song. Don't leave
+# them stranded mid-rebase -- resolve it into a clean, safe state.
+bash "$ROOT/.reprise/resolve"
+exit 1

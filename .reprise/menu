@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+#
+# What the "Reprise" launcher opens. Runs first-time setup by itself if it
+# hasn't been done, then offers the two things anyone actually needs.
+#
+# Keeps the window open at the end on purpose -- double-clicked windows vanish
+# the moment the script exits, taking any error message with them.
+#
+set -uo pipefail
+
+NO_AUTOCLOSE=0
+
+C_H='\033[1m'; C_D='\033[2m'; C_G='\033[32m'; C_R='\033[31m'; C_Y='\033[33m'; C_0='\033[0m'
+
+# Close the window we are running in.
+#
+# Terminal.app's default profile is "Don't close the window" when the shell
+# exits, so a script cannot close itself just by finishing -- hence the
+# AppleScript. It runs detached and after a short delay so that the shell has
+# already exited by the time the close lands; otherwise Terminal asks "do you
+# want to terminate the running process?".
+#
+# Best effort only. If it doesn't work the window simply stays open showing
+# [Process completed], which is exactly what happened before, so nothing is
+# made worse. Cmd+W always closes it by hand.
+close_window() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] || return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+  MY_TTY="$(tty 2>/dev/null)" || return 0
+  [ -n "$MY_TTY" ] || return 0
+  ( sleep 1
+    osascript <<OSA >/dev/null 2>&1
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if tty of t is "$MY_TTY" then close w saving no
+      end try
+    end repeat
+  end repeat
+end tell
+OSA
+  ) &
+  return 0
+}
+
+finish() {
+  rc=$?
+  if [ "${NO_AUTOCLOSE:-0}" = "1" ]; then
+    # A screen the user has been told to photograph. Never close it for them
+    # and never time out: they may be hunting for their phone.
+    printf '\n%bLeave this window open until you have sent that screenshot.%b\n' "$C_Y" "$C_0"
+    printf '%bPress Enter to close it once you are done.%b' "$C_D" "$C_0"
+    IFS= read -r _ || true
+    printf '\n'
+    return 0
+  fi
+  if [ "$rc" -eq 0 ]; then
+    # Went fine: give them a moment to read it, then get out of the way.
+    printf '\n%bAll done. Closing in 10 seconds (or press Enter).%b' "$C_D" "$C_0"
+    IFS= read -r -t 10 _ 2>/dev/null || true
+  else
+    # Something went wrong: the message above matters, so wait properly.
+    printf '\n%bSomething went wrong above. Press Enter to close.%b' "$C_Y" "$C_0"
+    IFS= read -r _ || true
+  fi
+  printf '\n'
+  close_window
+}
+trap finish EXIT
+
+# A screen meant to be photographed and sent to the maintainer. Deliberately loud, and
+# it suppresses the auto-close so it cannot vanish before the photo is taken.
+stop_screen() {
+  NO_AUTOCLOSE=1
+  _what="$1"; shift
+  printf '\n'
+  printf '%b##############################################################%b\n' "$C_R" "$C_0"
+  printf '%b##                                                          ##%b\n' "$C_R" "$C_0"
+  printf '%b##   STOP. SCREENSHOT THIS WINDOW AND SEND IT ON.           ##%b\n' "$C_R" "$C_0"
+  printf '%b##                                                          ##%b\n' "$C_R" "$C_0"
+  printf '%b##############################################################%b\n\n' "$C_R" "$C_0"
+  printf '%bYour work is safe. Nothing has been lost.%b\n\n' "$C_G" "$C_0"
+  printf 'What happened:\n'
+  printf '  %s\n\n' "$_what"
+  if [ "$#" -gt 0 ]; then
+    printf 'Songs involved:\n'
+    for _f in "$@"; do printf '  %s\n' "$_f"; done
+    printf '\n'
+  fi
+  printf '%bSend the screenshot to:%b %s\n' "$C_H" "$C_0" "$CONTACT_NAME"
+  [ -n "${CONTACT_HOW:-}" ] && printf '%b                       %s%b\n' "$C_D" "$CONTACT_HOW" "$C_0"
+  printf '\n%bDetails, so the screenshot is useful:%b\n' "$C_D" "$C_0"
+  printf '%b  branch : %s%b\n' "$C_D" "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" "$C_0"
+  printf '%b  saved  : %s%b\n' "$C_D" "$(git stash list 2>/dev/null | head -1)" "$C_0"
+  printf '%b  when   : %s%b\n\n' "$C_D" "$(date '+%Y-%m-%d %H:%M')" "$C_0"
+  printf 'Nothing else to do here. Leave that song alone until you hear back.\n'
+}
+
+cd "$(dirname "$0")/.." 2>/dev/null || { printf '%bCannot find the band folder.%b\n' "$C_R" "$C_0"; exit 1; }
+
+# ------------------------------------------------------------- sanity check --
+if ! command -v git >/dev/null 2>&1; then
+  printf '\n%bGit is not installed on this computer.%b\n\n' "$C_R" "$C_0"
+  printf '  Windows:  install Git for Windows -> https://gitforwindows.org\n'
+  printf '  Mac:      open Terminal, type  git  and press Enter. macOS will\n'
+  printf '            offer to install the developer tools. Click Install.\n\n'
+  exit 1
+fi
+
+if ! ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  printf '\n%bThis folder is not a copy of the band repo.%b\n' "$C_R" "$C_0"
+  printf 'See README.md for how to get one.\n\n'
+  exit 1
+fi
+cd "$ROOT" || exit 1
+
+# Shared settings, including who a bandmate should contact when something
+# goes wrong. Defaults keep the scripts working if the file is missing.
+CONTACT_NAME="whoever set this up"
+CONTACT_HOW=""
+# shellcheck source=/dev/null
+[ -f "$ROOT/.reprise/reprise.conf" ] && . "$ROOT/.reprise/reprise.conf"
+
+# ------------------------------- unfinished business from a previous run ----
+if [ -d "$(git rev-parse --git-path rebase-merge 2>/dev/null)" ] \
+   || [ -d "$(git rev-parse --git-path rebase-apply 2>/dev/null)" ] \
+   || [ -f "$(git rev-parse --git-path MERGE_HEAD 2>/dev/null)" ]; then
+  printf '\n%bLast time ended halfway through. Tidying that up before anything else.%b\n' "$C_Y" "$C_0"
+  bash "$ROOT/.reprise/resolve"
+  exit $?
+fi
+
+# -------------------------------------------- first run? set ourselves up ---
+if [ "$(git config --get core.hooksPath 2>/dev/null)" != ".reprise/hooks" ]; then
+  printf '\n%bFirst time on this computer -- setting things up.%b\n' "$C_H" "$C_0"
+  bash "$ROOT/.reprise/setup" || { printf '\n%bSetup did not finish.%b\n' "$C_R" "$C_0"; exit 1; }
+  printf '%bSetup done. You will not see this again.%b\n' "$C_G" "$C_0"
+fi
+
+# -------------------------------------------------------------------- menu ---
+printf '\n%b================ REPRISE ================%b\n\n' "$C_H" "$C_0"
+
+CHANGES="$(git status --porcelain 2>/dev/null)"
+if [ -n "$CHANGES" ]; then
+  printf '  %bYou have unsent changes.%b\n\n' "$C_Y" "$C_0"
+else
+  printf '  %bNothing changed since you last sent.%b\n\n' "$C_D" "$C_0"
+fi
+
+printf '  %b1%b  Send my work to the band   %b(just press Enter)%b\n' "$C_H" "$C_0" "$C_D" "$C_0"
+printf '  %b2%b  Get everyone else'\''s latest\n' "$C_H" "$C_0"
+printf '  %b3%b  Make audio to play along with\n' "$C_H" "$C_0"
+printf '  %bq%b  Close\n\n' "$C_H" "$C_0"
+printf '> '
+IFS= read -r CHOICE || CHOICE="q"
+
+case "$(printf '%s' "$CHOICE" | tr -d ' ')" in
+  ""|1) bash "$ROOT/.reprise/send"; exit $? ;;
+  2)
+    printf '\n%bGetting the latest...%b\n\n' "$C_H" "$C_0"
+
+    # Unsent work? Check both changed files and brand new ones.
+    git update-index -q --refresh >/dev/null 2>&1
+    DIRTY=0
+    git diff-index --quiet HEAD -- 2>/dev/null || DIRTY=1
+    [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ] && DIRTY=1
+
+    STASHED=0
+    if [ "$DIRTY" -eq 1 ]; then
+      printf '%bSetting your unsent work aside for a moment.%b\n' "$C_D" "$C_0"
+      if git stash push -u -m "reprise: before getting latest" >/dev/null 2>&1; then
+        STASHED=1
+      else
+        stop_screen "Your unsent work could not be set aside, so nothing was changed."
+        exit 1
+      fi
+    fi
+
+    if ! git pull --rebase; then
+      if [ "$STASHED" -eq 1 ]; then git stash pop >/dev/null 2>&1 || true; fi
+      stop_screen "The latest could not be downloaded. Your work has been put back."
+      exit 1
+    fi
+
+    if [ "$STASHED" -eq 1 ]; then
+      printf '%bPutting your unsent work back.%b\n' "$C_D" "$C_0"
+      # apply rather than pop: if it fails, the saved copy must survive.
+      if git stash apply >/dev/null 2>&1; then
+        git stash drop >/dev/null 2>&1
+      else
+        CONF=""
+        while IFS= read -r _c; do
+          [ -n "$_c" ] && CONF="$CONF $_c"
+        done < <(git diff --name-only --diff-filter=U 2>/dev/null)
+        # Back to the clean, just-downloaded state. The stash still holds their
+        # work, so this discards nothing.
+        git reset --hard >/dev/null 2>&1
+        # shellcheck disable=SC2086
+        stop_screen "You and someone else changed the same song, so your work could not be put back automatically." $CONF
+        exit 1
+      fi
+    fi
+
+    printf '\n%bUp to date.%b Open the tab in Guitar Pro and you have everyone'\''s latest.\n' "$C_G" "$C_0"
+    ;;
+  3) bash "$ROOT/.reprise/mp3" ;;
+  q|Q) printf '\nNothing done.\n' ;;
+  *)  printf '\n%bDid not understand "%s". Nothing done.%b\n' "$C_Y" "$CHOICE" "$C_0" ;;
+esac

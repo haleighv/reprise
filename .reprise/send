@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#
+# Interactive "send my work to the band" flow. Asks two short questions, builds
+# a commit message from the answers plus the list of what changed, then hands
+# off to .reprise/sync to do the actual commit and push.
+#
+# Reached from the "Reprise" launcher. You can also run it directly.
+#
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  printf '\033[31mThis folder is not a git repository.\033[0m\n' >&2; exit 1; }
+cd "$ROOT" || exit 1
+
+C_H='\033[1m'; C_D='\033[2m'; C_G='\033[32m'; C_Y='\033[33m'; C_0='\033[0m'
+
+# --------------------------------------------------------- anything to do? --
+if [ -z "$(git status --porcelain)" ]; then
+  printf '\n%bNothing has changed since last time.%b\n' "$C_G" "$C_0"
+  printf 'Everything you have is already shared with the band.\n\n'
+  exit 0
+fi
+
+# ------------------------------------------------- what changed, in English --
+# -uall matters: without it git collapses a new folder to "Song Name/" and the
+# song name can't be read off the path.
+changed_paths() { git status --porcelain -uall | cut -c4- | tr -d '"'; }
+
+# Which songs changed. A song is a top-level folder that holds a score, which
+# is what keeps README.md and .reprise/ out of the summary line.
+#
+# Written as a plain loop in this shell rather than inside $( ... ): bash 3.2,
+# which is what /bin/bash still is on macOS, mis-parses a `case` statement
+# inside a command substitution and dies on the pattern's closing bracket.
+# Keep case statements out of $( ) here.
+SONGS=""
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  top="${p%%/*}"
+  [ "$top" = "$p" ] && continue                        # root-level file
+  [ "$top" = ".band" ] && continue
+  [ "$top" = ".git" ] && continue
+  found=0
+  for g in "$top"/*.gp "$top"/*.gpx "$top"/*.gp3 "$top"/*.gp4 "$top"/*.gp5 "$top"/*.gtp; do
+    if [ -f "$g" ]; then found=1; break; fi
+  done
+  [ "$found" -eq 1 ] || continue
+  # already listed?
+  case ",$SONGS," in
+    *",$top,"*) continue ;;
+  esac
+  if [ -z "$SONGS" ]; then SONGS="$top"; else SONGS="$SONGS,$top"; fi
+done < <(changed_paths)
+
+# Full file list for the commit body.
+FILES="$(changed_paths | sed 's/^/  /')"
+
+printf '\n%bHere is what changed:%b\n\n' "$C_H" "$C_0"
+git status --short -uall | sed 's/^/  /'
+printf '\n'
+
+# ------------------------------------------------------------- the questions --
+printf '%bEnter a short description for these changes%b %b(press Enter to skip)%b\n' "$C_H" "$C_0" "$C_D" "$C_0"
+printf '> '
+IFS= read -r NOTE || NOTE=""
+
+printf '\n%bWhere were you?%b  %b1%b = home   %b2%b = studio   %b(Enter to skip)%b\n' \
+  "$C_H" "$C_0" "$C_H" "$C_0" "$C_H" "$C_0" "$C_D" "$C_0"
+printf '> '
+IFS= read -r WHERE || WHERE=""
+
+case "$(printf '%s' "$WHERE" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+  1|home|h)      LOC="home" ;;
+  2|studio|s)    LOC="studio" ;;
+  "")            LOC="" ;;
+  *)             LOC="$WHERE" ;;     # typed something else; keep their words
+esac
+
+# ------------------------------------------------------ build the message ----
+if [ -n "$SONGS" ]; then
+  SUBJECT="Update $(printf '%s' "$SONGS" | sed 's/,/, /g')"
+else
+  SUBJECT="Update $(date '+%Y-%m-%d')"
+fi
+[ -n "$LOC" ] && SUBJECT="$SUBJECT ($LOC)"
+
+MSG="$SUBJECT"
+[ -n "$NOTE" ] && MSG="$MSG
+
+$NOTE"
+MSG="$MSG
+
+Changed:
+$FILES"
+
+printf '\n%bSending this:%b\n\n' "$C_H" "$C_0"
+printf '%b%s%b\n\n' "$C_D" "$MSG" "$C_0"
+
+# ----------------------------------------------------------------- send it ---
+bash "$ROOT/.reprise/sync" "$MSG"
+exit $?
